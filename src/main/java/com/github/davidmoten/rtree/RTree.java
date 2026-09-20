@@ -56,6 +56,13 @@ public final class RTree<T, S extends Geometry> {
      * Current size in Entries of the RTree.
      */
     private final int size;
+
+    /**
+     * Lazily computed content fingerprint of the tree. The RTree is
+     * immutable so the value never changes for a given instance.
+     */
+    private volatile long structureVersion;
+    private volatile boolean structureVersionComputed;
     private static final Func2<Optional<Rectangle>, Entry<Object, Geometry>, Optional<Rectangle>> RECTANGLE_ACCUMULATOR =
             (rectangle, entry) ->
                     rectangle.map(value -> Optional.of(value.add(entry.geometry().mbr())))
@@ -933,6 +940,282 @@ public final class RTree<T, S extends Geometry> {
             return "";
         else
             return asString(root.get(), "");
+    }
+
+    // ----------------------------------------------------------------
+    // Resumable paged spatial queries
+    // ----------------------------------------------------------------
+
+    /**
+     * Returns the structural version of this tree: a deterministic content
+     * fingerprint covering node topology and child order, node minimum
+     * bounding rectangles, entry geometries and entry value hashes. Two
+     * logically identical trees (for instance a tree and its FlatBuffers
+     * round-trip with the {@link InternalStructure#SINGLE_ARRAY}
+     * representation) have the same version; any structural change changes
+     * it. The value is computed lazily and memoized because the tree is
+     * immutable.
+     *
+     * @return tree content fingerprint
+     */
+    public long structureVersion() {
+        long result = structureVersion;
+        if (!structureVersionComputed) {
+            synchronized (this) {
+                if (!structureVersionComputed) {
+                    result = StructureVersion.of(this);
+                    structureVersion = result;
+                    structureVersionComputed = true;
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Returns the first page of the paged intersection query with the given
+     * rectangle in natural depth-first order.
+     *
+     * @param r
+     *            rectangle to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @return first page
+     */
+    public Page<T, S> searchPage(Rectangle r, int pageSize) {
+        return searchPage(SearchQuery.<T, S>intersects(r), Sort.<T, S>none(), null, pageSize);
+    }
+
+    /**
+     * Returns the first page of the paged intersection query with the given
+     * point in natural depth-first order.
+     *
+     * @param p
+     *            point to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @return first page
+     */
+    public Page<T, S> searchPage(Point p, int pageSize) {
+        return searchPage(SearchQuery.<T, S>intersects(p.mbr()), Sort.<T, S>none(), null,
+                pageSize);
+    }
+
+    /**
+     * Returns the first page of the paged intersection query with the given
+     * circle.
+     *
+     * @param circle
+     *            circle to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @return first page
+     */
+    public Page<T, S> searchPage(Circle circle, int pageSize) {
+        return searchPage(SearchQuery.<T, S>intersects(circle), Sort.<T, S>none(), null,
+                pageSize);
+    }
+
+    /**
+     * Returns the first page of the paged intersection query with the given
+     * line.
+     *
+     * @param line
+     *            line to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @return first page
+     */
+    public Page<T, S> searchPage(Line line, int pageSize) {
+        return searchPage(SearchQuery.<T, S>intersects(line), Sort.<T, S>none(), null, pageSize);
+    }
+
+    /**
+     * Resumes (or starts, when {@code resumeToken} is null) the paged
+     * intersection query with the given rectangle.
+     *
+     * @param r
+     *            rectangle to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @param resumeToken
+     *            continuation token or null for the first page
+     * @return requested page
+     */
+    public Page<T, S> searchPage(Rectangle r, int pageSize, ResumeToken resumeToken) {
+        return searchPage(SearchQuery.<T, S>intersects(r), Sort.<T, S>none(), resumeToken,
+                pageSize);
+    }
+
+    /**
+     * Resumes (or starts, when {@code resumeToken} is null) the paged
+     * intersection query with the given point.
+     *
+     * @param p
+     *            point to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @param resumeToken
+     *            continuation token or null for the first page
+     * @return requested page
+     */
+    public Page<T, S> searchPage(Point p, int pageSize, ResumeToken resumeToken) {
+        return searchPage(SearchQuery.<T, S>intersects(p.mbr()), Sort.<T, S>none(), resumeToken,
+                pageSize);
+    }
+
+    /**
+     * Resumes (or starts, when {@code resumeToken} is null) the paged
+     * intersection query with the given circle.
+     *
+     * @param circle
+     *            circle to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @param resumeToken
+     *            continuation token or null for the first page
+     * @return requested page
+     */
+    public Page<T, S> searchPage(Circle circle, int pageSize, ResumeToken resumeToken) {
+        return searchPage(SearchQuery.<T, S>intersects(circle), Sort.<T, S>none(), resumeToken,
+                pageSize);
+    }
+
+    /**
+     * Resumes (or starts, when {@code resumeToken} is null) the paged
+     * intersection query with the given line.
+     *
+     * @param line
+     *            line to intersect
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @param resumeToken
+     *            continuation token or null for the first page
+     * @return requested page
+     */
+    public Page<T, S> searchPage(Line line, int pageSize, ResumeToken resumeToken) {
+        return searchPage(SearchQuery.<T, S>intersects(line), Sort.<T, S>none(), resumeToken,
+                pageSize);
+    }
+
+    /**
+     * Returns a page of the given paged query in natural depth-first order.
+     * Pass {@code resumeToken == null} (or use
+     * {@link Page#nextResumeToken()}) to start from the beginning.
+     *
+     * @param query
+     *            spatial query
+     * @param resumeToken
+     *            continuation token or null for the first page
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @return requested page
+     */
+    public Page<T, S> searchPage(SearchQuery<T, S> query, ResumeToken resumeToken, int pageSize) {
+        return searchPage(query, Sort.<T, S>none(), resumeToken, pageSize);
+    }
+
+    /**
+     * Returns a page of the given paged query with the given ordering. Pass
+     * {@code resumeToken == null} to start from the beginning.
+     *
+     * <p>
+     * The token is validated against the current tree structural version,
+     * the query id and predicate parameters and the sort parameters; any
+     * mismatch (including a tree modified since the token was issued, a
+     * different predicate or a different sort) fails closed with a
+     * {@link ResumeTokenException}.
+     *
+     * @param query
+     *            spatial query
+     * @param sort
+     *            ordering descriptor
+     * @param resumeToken
+     *            continuation token or null for the first page
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @return requested page
+     */
+    public Page<T, S> searchPage(SearchQuery<T, S> query, Sort<T, S> sort,
+            ResumeToken resumeToken, int pageSize) {
+        if (query == null) {
+            throw new IllegalArgumentException("query cannot be null");
+        }
+        if (sort == null) {
+            throw new IllegalArgumentException("sort cannot be null");
+        }
+        if (pageSize <= 0) {
+            throw new IllegalArgumentException(
+                    "pageSize must be positive but was " + pageSize);
+        }
+        long version = structureVersion();
+        if (resumeToken != null) {
+            resumeToken.validate(version, query, sort);
+        }
+        if (!root.isPresent()) {
+            return new Page<T, S>(java.util.Collections.<Entry<T, S>>emptyList(), null);
+        }
+        Node<T, S> rootNode = root.get();
+        if (sort.isNone()) {
+            return dfsPage(rootNode, query, sort, resumeToken, pageSize, version);
+        } else {
+            return sortedPage(rootNode, query, sort, resumeToken, pageSize, version);
+        }
+    }
+
+    private Page<T, S> dfsPage(Node<T, S> rootNode, SearchQuery<T, S> query, Sort<T, S> sort,
+            ResumeToken resumeToken, int pageSize, long version) {
+        if (resumeToken != null && resumeToken.isSorted()) {
+            throw new ResumeTokenException(
+                    "resume token rejected: token was issued for a sorted query but current sort is "
+                            + sort);
+        }
+        CursorPath start = resumeToken == null ? null : resumeToken.path();
+        CursorSearch.PageResult<T, S> result = CursorSearch.search(rootNode, query, start,
+                pageSize);
+        long emitted = (resumeToken == null ? 0L : resumeToken.emitted())
+                + result.entries.size();
+        boolean exhausted = result.path.isEmpty();
+        if (!exhausted) {
+            // A non empty continuation stack can remain even after the
+            // last matched entry was emitted (it only holds branches that
+            // the predicate will prune). Whether the page filled its budget
+            // or not, probe once for a following match before issuing a
+            // continuation so the last page is reliably terminal.
+            exhausted = !CursorSearch.hasNext(rootNode, query, result.path);
+        }
+        ResumeToken next = exhausted ? null
+                : ResumeToken.dfs(version, query, sort, result.path, emitted);
+        return new Page<T, S>(result.entries, next);
+    }
+
+    private Page<T, S> sortedPage(Node<T, S> rootNode, SearchQuery<T, S> query, Sort<T, S> sort,
+            ResumeToken resumeToken, int pageSize, long version) {
+        if (resumeToken != null && !resumeToken.isSorted()) {
+            throw new ResumeTokenException(
+                    "resume token rejected: token was issued for an unsorted query but current sort is "
+                            + sort);
+        }
+        // Sorted paging recomputes the deterministic total order on each
+        // page; tie breaking by DFS ordinal (the stable input order) makes
+        // the order identical for every page and for every structurally
+        // identical tree.
+        java.util.List<Entry<T, S>> ordered = CursorSearch.sortByDistance(
+                CursorSearch.allInDfsOrder(rootNode, query), sort.anchor());
+        int from = resumeToken == null ? 0 : resumeToken.offset();
+        if (from > ordered.size()) {
+            throw new ResumeTokenException(
+                    "resume token rejected: sorted offset " + from
+                            + " is beyond the number of matched entries " + ordered.size());
+        }
+        int to = Math.min(from + pageSize, ordered.size());
+        java.util.List<Entry<T, S>> pageEntries = new java.util.ArrayList<Entry<T, S>>(
+                ordered.subList(from, to));
+        ResumeToken next = null;
+        if (to < ordered.size()) {
+            next = ResumeToken.sorted(version, query, sort, to, to);
+        }
+        return new Page<T, S>(pageEntries, next);
     }
 
     private static final String MARGIN_INCREMENT = "  ";
