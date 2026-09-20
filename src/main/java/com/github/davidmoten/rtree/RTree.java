@@ -39,6 +39,9 @@ public final class RTree<T, S extends Geometry> {
     public static final Rectangle ZERO_RECTANGLE = rectangle(0, 0, 0, 0);
     private final Optional<? extends Node<T, S>> root;
     private final Context<T, S> context;
+    // computed lazily, 0 means not yet computed (a computed value of 0 is
+    // possible with probability 2^-64 in which case it is simply recomputed)
+    private volatile long structuralVersion;
 
     /**
      * Benchmarks show that this is a good choice for up to O(10,000) entries when
@@ -822,6 +825,75 @@ public final class RTree<T, S extends Geometry> {
      */
     public Observable<Entry<T, S>> entries() {
         return search(ALWAYS_TRUE);
+    }
+
+    /**
+     * Returns a 64-bit fingerprint of the structure and geometry content of this
+     * R-tree. Two trees with identical structure and geometry content (for
+     * example a tree and its serialization round-trip, or two trees built with
+     * the same sequence of insertions) have the same structural version, while
+     * any structural modification (add, delete, node split) changes the version
+     * with probability 1 - 2^-64. The value is computed lazily and cached.
+     *
+     * @return structural version of this R-tree
+     */
+    public long structuralVersion() {
+        long v = structuralVersion;
+        if (v == 0) {
+            v = StructuralVersion.compute(root, size, context);
+            structuralVersion = v;
+        }
+        return v;
+    }
+
+    /**
+     * Returns the first page (of up to {@code pageSize} entries) of a stable
+     * depth-first search of this R-tree for entries whose minimum bounding
+     * rectangle intersects the given rectangle. The traversal order is
+     * identical to {@link #search(Rectangle)}. If {@link SearchPage#hasNext()}
+     * is true, the token in {@link SearchPage#nextToken()} can be presented to
+     * {@link #searchPage(Rectangle, ResumeToken)} to obtain the next page,
+     * including from another process or against another tree instance with
+     * identical structure and content (for example after a serialization
+     * round-trip). The concatenation of all pages equals the one-shot
+     * {@link #search(Rectangle)} result item for item.
+     *
+     * @param r
+     *            rectangle to check intersection with
+     * @param pageSize
+     *            maximum number of entries per page (must be positive)
+     * @return the first page of results
+     */
+    public SearchPage<T, S> searchPage(Rectangle r, int pageSize) {
+        if (pageSize <= 0) {
+            throw new IllegalArgumentException("pageSize must be positive but was " + pageSize);
+        }
+        return SearchPager.firstPage(this, r, pageSize);
+    }
+
+    /**
+     * Returns the next page of a paged search previously started with
+     * {@link #searchPage(Rectangle, int)}. The same rectangle used to start the
+     * search must be supplied. This method fails closed with a
+     * {@link ResumeTokenException} (returning no results) if the token was
+     * issued against a tree that has since been structurally modified, if the
+     * given rectangle differs from the one the token was created with, if the
+     * token order is not supported, or if the traversal path recorded in the
+     * token is not valid for this tree.
+     *
+     * @param r
+     *            the same rectangle used to start the paged search
+     * @param token
+     *            token from {@link SearchPage#nextToken()} of the previous page
+     * @return the next page of results
+     * @throws ResumeTokenException
+     *             if the token cannot be honoured by this tree
+     */
+    public SearchPage<T, S> searchPage(Rectangle r, ResumeToken token) {
+        if (token == null) {
+            throw new IllegalArgumentException("token cannot be null");
+        }
+        return SearchPager.nextPage(this, r, token);
     }
 
     /**
